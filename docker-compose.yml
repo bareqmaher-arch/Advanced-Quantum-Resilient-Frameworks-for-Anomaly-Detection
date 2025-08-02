@@ -1,0 +1,411 @@
+# Q-ZAP Framework Docker Compose Configuration
+# =============================================
+# Complete multi-service deployment for Q-ZAP framework
+
+version: '3.8'
+
+services:
+  # Core Q-ZAP Framework Service
+  qzap-core:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile
+      args:
+        BUILD_ENV: production
+        ENABLE_GPU: "false"
+    image: qzap:latest
+    container_name: qzap-core
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # Web UI
+      - "8443:8443"   # HTTPS API
+      - "9090:9090"   # Metrics
+    environment:
+      - QZAP_ENV=production
+      - QZAP_LOG_LEVEL=INFO
+      - QZAP_DATABASE_URL=postgresql://qzap:qzap_password@postgres:5432/qzap
+      - QZAP_REDIS_URL=redis://redis:6379/0
+      - QZAP_ELASTICSEARCH_URL=http://elasticsearch:9200
+      - QZAP_PROMETHEUS_URL=http://prometheus:9090
+    volumes:
+      - qzap_data:/app/data
+      - qzap_models:/app/models
+      - qzap_logs:/app/logs
+      - qzap_config:/app/config
+      - qzap_keys:/app/keys
+    depends_on:
+      - postgres
+      - redis
+      - elasticsearch
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # HAE Training Service
+  qzap-trainer:
+    image: qzap:latest
+    container_name: qzap-trainer
+    restart: "no"  # Run on-demand
+    environment:
+      - QZAP_ENV=production
+      - QZAP_TRAINING_MODE=true
+    volumes:
+      - qzap_data:/app/data
+      - qzap_models:/app/models
+      - qzap_logs:/app/logs
+    depends_on:
+      - qzap-core
+    networks:
+      - qzap-network
+    command: ["qzap-train", "--config", "/app/config/training.yaml"]
+    profiles:
+      - training
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: qzap-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=qzap
+      - POSTGRES_USER=qzap
+      - POSTGRES_PASSWORD=qzap_password
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deployment/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qzap -d qzap"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: qzap-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass redis_password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Elasticsearch for Log Analytics
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: qzap-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Kibana for Log Visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: qzap-kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - XPACK_SECURITY_ENABLED=false
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus for Metrics Collection
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: qzap-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deployment/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana for Metrics Visualization
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: qzap-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin_password
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deployment/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deployment/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Apache Kafka for Event Streaming
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: qzap-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    networks:
+      - qzap-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: qzap-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MinIO for Object Storage
+  minio:
+    image: minio/minio:RELEASE.2023-11-20T22-40-07Z
+    container_name: qzap-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minio_admin
+      - MINIO_ROOT_PASSWORD=minio_password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Jaeger for Distributed Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.50
+    container_name: qzap-jaeger
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Jaeger collector HTTP
+      - "4317:4317"    # OTLP gRPC receiver
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:16686/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # NGINX Reverse Proxy
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: qzap-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deployment/nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - qzap-core
+      - grafana
+      - kibana
+    networks:
+      - qzap-network
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Filebeat for Log Shipping
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.0
+    container_name: qzap-filebeat
+    restart: unless-stopped
+    user: root
+    volumes:
+      - ./deployment/logging/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - qzap_logs:/app/logs:ro
+      - nginx_logs:/var/log/nginx:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - elasticsearch
+    networks:
+      - qzap-network
+    command: ["--strict.perms=false"]
+
+  # Quantum Circuit Simulator Service
+  qzap-quantum:
+    image: qzap:latest
+    container_name: qzap-quantum
+    restart: unless-stopped
+    environment:
+      - QZAP_ENV=production
+      - QZAP_QUANTUM_MODE=true
+      - QZAP_SIMULATOR_BACKEND=qasm_simulator
+    volumes:
+      - qzap_models:/app/models
+      - qzap_logs:/app/logs
+    depends_on:
+      - qzap-core
+    networks:
+      - qzap-network
+    command: ["qzap", "quantum", "simulator", "--workers", "4"]
+
+  # Federated Learning Coordinator
+  qzap-fl-coordinator:
+    image: qzap:latest
+    container_name: qzap-fl-coordinator
+    restart: unless-stopped
+    environment:
+      - QZAP_ENV=production
+      - QZAP_FL_MODE=coordinator
+      - QZAP_FL_ROUNDS=10
+      - QZAP_FL_MIN_CLIENTS=2
+    ports:
+      - "8765:8765"  # FL coordination port
+    volumes:
+      - qzap_models:/app/models
+      - qzap_logs:/app/logs
+    depends_on:
+      - qzap-core
+    networks:
+      - qzap-network
+    command: ["qzap", "federated", "coordinator", "--port", "8765"]
+    profiles:
+      - federated-learning
+
+# Named Volumes
+volumes:
+  qzap_data:
+    driver: local
+  qzap_models:
+    driver: local
+  qzap_logs:
+    driver: local
+  qzap_config:
+    driver: local
+  qzap_keys:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  zookeeper_logs:
+    driver: local
+  kafka_data:
+    driver: local
+  minio_data:
+    driver: local
+  nginx_logs:
+    driver: local
+
+# Networks
+networks:
+  qzap-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Service Profiles
+# Usage: docker-compose --profile training up
+# Available profiles:
+# - training: Includes HAE training service
+# - federated-learning: Includes FL coordinator
+# - monitoring: Full monitoring stack
+# - development: Development services with debug tools

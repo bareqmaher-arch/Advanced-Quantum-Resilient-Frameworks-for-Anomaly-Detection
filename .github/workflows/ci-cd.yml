@@ -1,0 +1,624 @@
+# Q-ZAP Framework CI/CD Pipeline
+# ==============================
+# Comprehensive CI/CD workflow for automated testing, building, and deployment
+
+name: Q-ZAP CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run nightly builds at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # =============================================================================
+  # CODE QUALITY AND TESTING
+  # =============================================================================
+  
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        
+    - name: Code formatting check
+      run: |
+        black --check src/ tests/ setup.py
+        isort --check-only src/ tests/ setup.py
+        
+    - name: Linting
+      run: |
+        flake8 src/ tests/
+        mypy src/ --ignore-missing-imports
+        
+    - name: Security checks
+      run: |
+        bandit -r src/ -f json -o bandit-report.json
+        safety check --json --output safety-report.json
+      continue-on-error: true
+      
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports-${{ matrix.python-version }}
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        
+    - name: Run unit tests
+      run: |
+        pytest tests/unit/ -v \
+          --cov=src \
+          --cov-report=xml \
+          --cov-report=html \
+          --junitxml=test-results.xml
+          
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          test-results.xml
+          coverage.xml
+          htmlcov/
+          
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: qzap_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        
+    - name: Run integration tests
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/qzap_test
+        REDIS_URL: redis://localhost:6379/0
+      run: |
+        pytest tests/integration/ -v --junitxml=integration-results.xml
+        
+    - name: Upload integration test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: integration-test-results
+        path: integration-results.xml
+
+  # =============================================================================
+  # DOCKER BUILD AND SECURITY SCAN
+  # =============================================================================
+  
+  docker-build:
+    name: Docker Build and Scan
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha
+          
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./deployment/docker/Dockerfile
+        push: false
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        load: true
+        
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.meta.outputs.tags }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+    - name: Push Docker image
+      if: github.event_name != 'pull_request'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./deployment/docker/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # =============================================================================
+  # QUANTUM SIMULATION TESTS
+  # =============================================================================
+  
+  quantum-tests:
+    name: Quantum Circuit Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install quantum dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[quantum,dev]"
+        
+    - name: Test quantum circuits
+      run: |
+        pytest tests/quantum/ -v --junitxml=quantum-results.xml
+        
+    - name: Benchmark quantum performance
+      run: |
+        python benchmarks/quantum_benchmark.py --output quantum-benchmark.json
+        
+    - name: Upload quantum test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: quantum-test-results
+        path: |
+          quantum-results.xml
+          quantum-benchmark.json
+
+  # =============================================================================
+  # PERFORMANCE BENCHMARKS
+  # =============================================================================
+  
+  performance-tests:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        
+    - name: Download benchmark data
+      run: |
+        mkdir -p data/benchmark
+        python scripts/download_benchmark_data.py
+        
+    - name: Run performance benchmarks
+      run: |
+        python benchmarks/anomaly_detection_benchmark.py --output benchmark-results.json
+        python benchmarks/pqc_performance_benchmark.py --output pqc-benchmark.json
+        
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v3
+      with:
+        name: benchmark-results
+        path: |
+          benchmark-results.json
+          pqc-benchmark.json
+          
+    - name: Comment benchmark results on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const results = JSON.parse(fs.readFileSync('benchmark-results.json', 'utf8'));
+          
+          const comment = `## 🚀 Performance Benchmark Results
+          
+          | Metric | Value | Status |
+          |--------|-------|--------|
+          | HAE F1-Score | ${results.hae_f1_score} | ${results.hae_f1_score > 0.9 ? '✅' : '⚠️'} |
+          | Detection Latency | ${results.detection_latency_ms}ms | ${results.detection_latency_ms < 100 ? '✅' : '⚠️'} |
+          | PQC Handshake Time | ${results.pqc_handshake_ms}ms | ${results.pqc_handshake_ms < 200 ? '✅' : '⚠️'} |
+          | Memory Usage | ${results.memory_usage_mb}MB | ${results.memory_usage_mb < 1000 ? '✅' : '⚠️'} |
+          
+          Full benchmark report available in artifacts.`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+
+  # =============================================================================
+  # END-TO-END TESTS
+  # =============================================================================
+  
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: [docker-build, integration-tests]
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Compose
+      run: |
+        sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+        
+    - name: Start services
+      run: |
+        docker-compose -f docker-compose.yml -f docker-compose.test.yml up -d
+        sleep 60  # Wait for services to be ready
+        
+    - name: Wait for services
+      run: |
+        timeout 300 bash -c 'until curl -f http://localhost:8080/health; do sleep 5; done'
+        
+    - name: Run E2E tests
+      run: |
+        docker-compose exec -T qzap-core pytest tests/e2e/ -v --junitxml=e2e-results.xml
+        
+    - name: Collect service logs
+      if: always()
+      run: |
+        docker-compose logs > service-logs.txt
+        
+    - name: Stop services
+      if: always()
+      run: |
+        docker-compose down -v
+        
+    - name: Upload E2E test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: e2e-test-results
+        path: |
+          e2e-results.xml
+          service-logs.txt
+
+  # =============================================================================
+  # SECURITY SCANNING
+  # =============================================================================
+  
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Run CodeQL Analysis
+      uses: github/codeql-action/init@v2
+      with:
+        languages: python
+        
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v2
+      
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+      
+    - name: Run Semgrep Security Scanner
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: auto
+        
+    - name: Run OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'Q-ZAP'
+        path: '.'
+        format: 'ALL'
+        
+    - name: Upload OWASP report
+      uses: actions/upload-artifact@v3
+      with:
+        name: owasp-report
+        path: reports/
+
+  # =============================================================================
+  # DEPLOYMENT
+  # =============================================================================
+  
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [e2e-tests, security-scan]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-west-2
+        
+    - name: Deploy to EKS Staging
+      run: |
+        aws eks update-kubeconfig --name qzap-staging-cluster
+        kubectl apply -f deployment/kubernetes/staging/
+        kubectl rollout restart deployment/qzap-core
+        
+    - name: Run smoke tests
+      run: |
+        sleep 60
+        curl -f https://staging.qzap.example.com/health
+        
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [e2e-tests, security-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-west-2
+        
+    - name: Deploy to EKS Production
+      run: |
+        aws eks update-kubeconfig --name qzap-production-cluster
+        kubectl apply -f deployment/kubernetes/production/
+        kubectl rollout restart deployment/qzap-core
+        
+    - name: Run production smoke tests
+      run: |
+        sleep 120
+        curl -f https://api.qzap.example.com/health
+        
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## Q-ZAP Framework Release ${{ github.ref }}
+          
+          ### Changes
+          - See commit history for detailed changes
+          
+          ### Deployment
+          - ✅ Production deployment successful
+          - ✅ Smoke tests passed
+          
+          ### Performance
+          - See benchmark artifacts for performance metrics
+        draft: false
+        prerelease: false
+        
+    - name: Notify production deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#production'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # =============================================================================
+  # CLEANUP AND REPORTING
+  # =============================================================================
+  
+  cleanup:
+    name: Cleanup and Reporting
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Generate test report
+      run: |
+        echo "# Q-ZAP CI/CD Test Report" > test-report.md
+        echo "Generated on: $(date)" >> test-report.md
+        echo "" >> test-report.md
+        
+        if [ -d "test-results-3.11" ]; then
+          echo "## Unit Tests ✅" >> test-report.md
+        else
+          echo "## Unit Tests ❌" >> test-report.md
+        fi
+        
+        if [ -d "integration-test-results" ]; then
+          echo "## Integration Tests ✅" >> test-report.md
+        else
+          echo "## Integration Tests ❌" >> test-report.md
+        fi
+        
+    - name: Upload final report
+      uses: actions/upload-artifact@v3
+      with:
+        name: final-test-report
+        path: test-report.md
+        
+    - name: Clean up old artifacts
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+          });
+          
+          // Keep only the latest 10 artifacts per type
+          const artifactsByName = {};
+          artifacts.data.artifacts.forEach(artifact => {
+            if (!artifactsByName[artifact.name]) {
+              artifactsByName[artifact.name] = [];
+            }
+            artifactsByName[artifact.name].push(artifact);
+          });
+          
+          for (const [name, artifacts] of Object.entries(artifactsByName)) {
+            if (artifacts.length > 10) {
+              const toDelete = artifacts.slice(10);
+              for (const artifact of toDelete) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
+          }
