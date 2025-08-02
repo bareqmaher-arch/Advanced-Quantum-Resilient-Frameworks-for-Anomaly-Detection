@@ -305,7 +305,7 @@ Where θᵢ values are derived from the classical encoder output.
 - **CPU Usage**: +12% during handshake
 - **Throughput**: Minimal impact (<2% reduction)
 
-## 🤝 Contributing
+🤝 Contributing
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -326,33 +326,17 @@ flake8 src/
 mypy src/
 ```
 
-## 📝 Citation
-
-If you use this work in your research, please cite:
-
-```bibtex
-@article{qzap2025,
-  title={Advanced Quantum-Resilient Frameworks for Anomaly Detection in Multi-Tenant Hybrid Cloud Environments},
-  author={[Author Names]},
-  journal={International Journal of Computer Applications},
-  year={2025},
-  volume={X},
-  number={Y},
-  pages={1--15}
-}
-```
-
-## 📄 License
+📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🆘 Support
+🆘 Support
 
 - **Documentation**: [docs/](docs/)
 - **Issues**: [GitHub Issues](https://github.com/bareqmaher-arch/Advanced-Quantum-Resilient-Frameworks-for-Anomaly-Detection/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/bareqmaher-arch/Advanced-Quantum-Resilient-Frameworks-for-Anomaly-Detection/discussions)
 
-## 🗺️ Roadmap
+🗺️ Roadmap
 
 - [ ] **Phase 1**: Core framework implementation ✅
 - [ ] **Phase 2**: Hardware quantum device integration
@@ -360,7 +344,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ ] **Phase 4**: Formal verification tools
 - [ ] **Phase 5**: Production-ready enterprise features
 
-## 📚 Related Work
+📚 Related Work
 
 - [Post-Quantum Cryptography NIST Standards](https://www.nist.gov/post-quantum-cryptography)
 - [TensorFlow Quantum](https://www.tensorflow.org/quantum)
