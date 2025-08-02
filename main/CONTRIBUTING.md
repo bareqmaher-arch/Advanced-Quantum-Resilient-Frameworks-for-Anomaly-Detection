@@ -295,7 +295,7 @@ Recommended development tools:
 
 ```bash
 # Clone repository
-git clone https://github.com/YOUR-USERNAME/Advanced-Quantum-Resilient-Frameworks-for-Anomaly-Detection.git
+git clone https://github.com/bareqmaher-arch/Advanced-Quantum-Resilient-Frameworks-for-Anomaly-Detection.git
 cd Advanced-Quantum-Resilient-Frameworks-for-Anomaly-Detection
 
 # Set up development environment
@@ -339,7 +339,7 @@ qzap --version
 
 - **GitHub Issues**: Bug reports and feature requests
 - **GitHub Discussions**: General discussions and Q&A
-- **Security Issues**: Email security@qzap-framework.org for security vulnerabilities
+- **Security Issues**: Email arem.naji@gmail.com for security vulnerabilities
 
 ### Code of Conduct
 
